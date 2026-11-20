@@ -6,6 +6,10 @@ MicBridge makes the Jio remote's microphone work in apps that Jio never whitelis
 
 It was built and tested for the **JHSD200** (Android 11, SDK 30) running production Jio firmware, where the mic key is hard-wired to Jio's voice assistant. Not sure about other models you can try.
 
+![MicBridge demo: the mic key is pressed in SmartTube, the Jio voice overlay appears, and "hello" lands in the search box](docs/demo.gif)
+
+*Recorded on a JHSD200: SmartTube home → search → mic key → “hello” typed into the search box → results.*
+
 ---
 
 ## The problem
