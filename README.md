@@ -69,7 +69,7 @@ Everything else gets the generic flow. Note that the firmware's list can also co
 
 ## Install
 
-Download `micbridge.apk` from the [latest release](../../releases/latest), then:
+Download `micbridge.apk` from the [latest release](https://github.com/Lucifer7535/micbridge/releases/latest), then:
 
 ```bash
 adb connect <STB_IP>:5555
