@@ -173,7 +173,11 @@ public class MicA11yService extends AccessibilityService {
         if ((kc == KeyEvent.KEYCODE_VOICE_ASSIST || kc == KeyEvent.KEYCODE_SEARCH)
                 && event.getAction() == KeyEvent.ACTION_DOWN
                 && event.getRepeatCount() == 0) {
-            keyApp = lastApp;
+            // Ask for the focused app right now instead of trusting the last
+            // window event: some boxes/apps do not emit state changes.
+            String front = activeAppPackage();
+            keyApp = (front != null && !JIO_VA.equals(front)
+                    && !getPackageName().equals(front)) ? front : lastApp;
             keyAppAt = System.currentTimeMillis();
             L.f(this, "mic key kc=" + kc + " scan=" + event.getScanCode()
                     + " app=" + keyApp);
