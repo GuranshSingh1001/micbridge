@@ -86,17 +86,19 @@ Installing an APK kills the accessibility binding, so **re-enable the service af
 
 ### Enable the accessibility service
 
-Keep the two stock services in the list (`com.iwedia.ledmanager/...KeyEventMonitorService` and `com.klevico.monet/...LauncherAccessibilityService`). Replacing the list with only MicBridge will break the remote and launcher keys.
+Keep whatever stock services are already listed — on our JHSD200 that is `com.iwedia.ledmanager/...KeyEventMonitorService` and `com.klevico.monet/...LauncherAccessibilityService`; other boxes ship different ones. Replacing the list with only MicBridge will break the remote and launcher keys.
 
 ```bash
 CUR=$(adb shell settings get secure enabled_accessibility_services | tr -d '\r')
-if [ -z "$CUR" ] || [ "$CUR" = "null" ]; then
-  NEW="dev.dedsec.micbridge/.MicA11yService"
-else
-  NEW="$CUR:dev.dedsec.micbridge/.MicA11yService"
-fi
-adb shell settings put secure enabled_accessibility_services "$NEW"
+case "$CUR" in
+  *dev.dedsec.micbridge*) NEW="$CUR" ;;              # already listed
+  ""|null) NEW="dev.dedsec.micbridge/.MicA11yService" ;;
+  *) NEW="$CUR:dev.dedsec.micbridge/.MicA11yService" ;;
+esac
+# This firmware sometimes clears the list when the service is disabled, so
+# write it *after* turning accessibility off and before turning it back on.
 adb shell settings put secure accessibility_enabled 0
+adb shell settings put secure enabled_accessibility_services "$NEW"
 adb shell settings put secure accessibility_enabled 1
 ```
 
