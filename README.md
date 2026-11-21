@@ -48,10 +48,11 @@ Delivery is generic, in this order:
 
 1. the focused editable field,
 2. otherwise the first editable field in the window,
-3. otherwise the first node whose text or content description mentions "Search" (clicked, then retried),
-4. otherwise it gives up quietly — nothing is typed and the app is left untouched.
+3. otherwise a Leanback search box: a node whose class contains `StreamingTextView`/`SearchEditText`, or whose id looks like a search field (`lb_search_text_editor`, `search_text`, `search_box`, …),
+4. otherwise the first node whose text or content description mentions "Search" (clicked, then retried — this is what opens the search screen in SmartTube, TizenTube and most Leanback apps),
+5. otherwise it gives up quietly — nothing is typed and the app is left untouched.
 
-SmartTube gets a dedicated path because its search box is an `androidx.leanback.widget.StreamingTextView`, not an editable field, and its search screen is a separate window. MicBridge clicks the search orb, then fills `lb_search_text_editor`.
+Leanback apps such as SmartTube and TizenTube have no editable field at all: their search box is a `StreamingTextView`, so it is filled with `ACTION_SET_TEXT` directly. Browsers such as TV Bro get an extra click + focus + retry because their WebView text field often rejects the first `ACTION_SET_TEXT`.
 
 The same APK registers a handler for `RecognizerIntent.ACTION_RECOGNIZE_SPEECH`, so apps that ship their own mic button can launch a working recogniser.
 
@@ -59,11 +60,10 @@ The same APK registers a handler for `RecognizerIntent.ACTION_RECOGNIZE_SPEECH`,
 
 Routing is **global with a blocklist**. These keep their stock Jio behaviour and are never touched:
 
-- every package in `Settings.Global remote_app_list` (JioTV+, Hotstar, Netflix, Prime Video, `com.jio.yt`, Zee5, SonyLIV, Sun NXT, …),
-- every `com.jio.*`, `com.jiostb.*` and `com.iwedia.*` package,
-- Settings, SystemUI, `android`, the Jio voice app, the launcher (`com.klevico.monet`) and MicBridge itself.
+- the Jio/preset apps (JioTV+, Hotstar, Netflix, Prime Video, `com.jio.yt`, Zee5, SonyLIV, Sun NXT, Hoichoi, EPIC ON, Ultra Jhakaas, ETV Win, and everything under `com.jio.*`, `com.jiostb.*`, `com.jiotv.*`, `com.iwedia.*`),
+- Settings, SystemUI, `android`, the Jio voice app, the current launcher and MicBridge itself.
 
-Everything else gets the generic flow. Note that the firmware's list can also contain user-installed apps that were added to the Jio launcher (for example TVExplorer or Shevery); those are treated as preset apps and stay blocked. See [Changing the blocklist](#changing-the-blocklist).
+Everything else gets the generic flow — **including apps that the Jio launcher has added to `Settings.Global remote_app_list`** (TVExplorer, Shevery, a sideloaded TizenTube, …). Version 1.0 blocked every package in that list, which silently disabled MicBridge for sideloaded apps pinned to the Jio home screen; 1.1 uses the explicit list above instead.
 
 ## Requirements
 
@@ -105,8 +105,8 @@ Confirm it bound:
 ```bash
 adb shell settings get secure enabled_accessibility_services
 adb logcat -s MicBridge
-# I MicBridge: service connected; flags=114
-# I MicBridge: remote_app_list entries=27
+# I MicBridge: service connected; flags=114 home=com.klevico.monet
+# I MicBridge: blocklist: Jio/preset + launcher + Settings/SystemUI; allow=
 ```
 
 The service also starts on its own after a reboot, as long as it stays in `enabled_accessibility_services`.
@@ -133,6 +133,18 @@ Omit `--es target` to use the last foreground app, or omit `--es query` to captu
 ```bash
 adb logcat -s MicBridge
 ```
+
+A working press looks like this:
+
+```text
+mic key kc=231 scan=217
+voice overlay over org.smarttube.stable -> capturing
+captured query: "hello"
+deliverToApp try=0 top=org.smarttube.stable target=org.smarttube.stable
+typed into org.smarttube.stable (StreamingTextView#lb_search_text_editor): hello
+```
+
+If the second line says `-> blocked`, the app is on the blocklist (use `micbridge_allow`). If the last line says `no text field in <pkg>`, the app needs its search screen opened first.
 
 The same log is appended to `/sdcard/Android/data/dev.dedsec.micbridge/files/micbridge.log`.
 
@@ -173,21 +185,38 @@ micbridge.apk
 
 ## Changing the blocklist
 
-Edit `isBlocked()` in `MicA11yService.java`:
+You do not need to rebuild. `micbridge_allow` is a comma/space separated list of package names that always get the generic flow, even if they are Jio/preset/launcher packages. A trailing `*` matches a prefix:
+
+```bash
+# allow one app (e.g. a TizenTube APK that reuses com.jio.yt)
+adb shell settings put global micbridge_allow "com.jio.yt"
+
+# allow a whole family, plus one exact package
+adb shell settings put global micbridge_allow "com.jio.*,com.example.app"
+```
+
+The setting is read live; no restart is needed. Clear it with:
+
+```bash
+adb shell settings delete global micbridge_allow
+```
+
+To change the built-in list instead, edit `MicA11yService.java`:
 
 ```java
 private static final String[] BLOCKED_EXACT = { ... };
-private static final String[] BLOCKED_PREFIX = { "com.iwedia.", "com.jio.", "com.jiostb." };
+private static final String[] BLOCKED_PREFIX = { "com.iwedia.", "com.jio.", "com.jiostb.", "com.jiotv." };
 ```
 
-The list from `Settings.Global remote_app_list` is added at runtime. Then rebuild and reinstall. For example, to let MicBridge handle TVExplorer, remove it from the firmware list or special-case it before the `remoteApps.contains(pkg)` check.
+then rebuild and reinstall.
 
 ## Troubleshooting
 
 | Symptom | Cause / fix |
 | --- | --- |
-| Nothing is typed, log ends with `no destination` | The app has no text field and no visible "Search" entry point. Open its search screen first. |
-| The mic still opens Jio's universal search | The app is blocklisted (in `remote_app_list` or a Jio/Iwedia package). See above. |
+| Nothing is typed, log ends with `no text field in <pkg>; nothing typed` | The app has no text field and no visible "Search" entry point. Open its search screen first. |
+| The mic still opens Jio's universal search, log says `voice overlay over <pkg> -> blocked` | The app is on the built-in Jio/preset/launcher blocklist. Add it to `micbridge_allow` (see above). |
+| The mic still opens Jio's universal search and the log shows nothing after `service connected` | 1.0 logged no routing decisions. Upgrade to 1.1, which logs `blocked` vs `capturing` for every press. |
 | Nothing happens at all | The accessibility service is not enabled/bound. Re-run the enable steps and check `adb logcat -s MicBridge`. |
 | Service disappears after a reboot | Ensure it is listed in `enabled_accessibility_services`; toggling `accessibility_enabled` off/on also rebinds it. |
 | Wrong app receives the text | `lastApp` was stale. Press mic while the target app is in the foreground. |

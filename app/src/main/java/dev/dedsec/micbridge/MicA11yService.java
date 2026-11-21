@@ -6,6 +6,8 @@ import android.content.BroadcastReceiver;
 import android.content.Context;
 import android.content.Intent;
 import android.content.IntentFilter;
+import android.content.pm.PackageManager;
+import android.content.pm.ResolveInfo;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
@@ -15,12 +17,8 @@ import android.view.accessibility.AccessibilityEvent;
 import android.view.accessibility.AccessibilityNodeInfo;
 import android.view.accessibility.AccessibilityWindowInfo;
 
-import java.util.HashSet;
 import java.util.List;
 import java.util.Locale;
-import java.util.Set;
-import java.util.regex.Matcher;
-import java.util.regex.Pattern;
 
 /**
  * Routes the Jio remote's microphone key to sideloaded apps.
@@ -31,19 +29,19 @@ import java.util.regex.Pattern;
  * voiceStatesView, closes the overlay and types the text into the app that
  * was in the foreground.
  *
- * The routing is global: every application gets the generic delivery below,
- * except the ones Jio already knows about (the firmware's remote_app_list, the
- * launcher, Settings and SystemUI). For those the mic keeps its stock
- * behaviour untouched.
+ * Routing is global. Only Jio/preset apps, the current launcher, Settings and
+ * SystemUI keep their stock behaviour. A package can always be forced back
+ * into the generic flow with:
+ *
+ *   adb shell settings put global micbridge_allow "com.example.app,com.other.*"
  */
 public class MicA11yService extends AccessibilityService {
 
     static final String JIO_VA = "com.android.app.jio.voiceassist";
-    static final String SMARTTUBE = "org.smarttube.stable";
-
     static final String ID_VOICE_STATE = JIO_VA + ":id/voiceStatesView";
-    static final String ID_ST_SEARCH_EDIT = SMARTTUBE + ":id/lb_search_text_editor";
-    static final String ID_ST_SEARCH_ORB = SMARTTUBE + ":id/search_orb";
+
+    /** Comma/space separated allowlist, supports a trailing "*" wildcard. */
+    static final String SETTING_ALLOW = "micbridge_allow";
 
     /** Packages that always keep the stock Jio mic behaviour. */
     private static final String[] BLOCKED_EXACT = {
@@ -53,32 +51,43 @@ public class MicA11yService extends AccessibilityService {
             "com.android.tv.settings",
             "com.android.tv.settings.local",
             "com.klevico.monet",
+            "com.gathin.tvhome",
+            "in.startv.hotstar",
+            "com.netflix.ninja",
+            "com.amazon.amazonvideo.livingroom",
+            "com.zee5.aosp",
+            "com.suntv.sunnxt",
+            "com.hoichoi.mitv",
+            "com.epicchannel.epicon",
+            "com.ultrajhakaas.android",
+            "com.etvwin.androidtv",
     };
     private static final String[] BLOCKED_PREFIX = {
             "com.iwedia.",
             "com.jio.",
             "com.jiostb.",
+            "com.jiotv.",
     };
-
-    private static final Pattern REMOTE_PKG =
-            Pattern.compile("\"pkg\"\\s*:\\s*\"([^\"]+)\"");
 
     private final Handler h = new Handler(Looper.getMainLooper());
 
     /** last non-Jio, non-self application package */
     private String lastApp = "";
 
-    /** packages listed in Settings.Global remote_app_list (Jio remote apps) */
-    private final Set<String> remoteApps = new HashSet<>();
-    private boolean remoteLoaded;
+    /** package that was in front when the mic key went down */
+    private String keyApp = "";
+    private long keyAppAt;
 
     private boolean busy;
     private long lastTrigger;
+    private long lastBlockedLog;
     private String lastQuery;
     private int stableCount;
 
     /** set once we clicked a search entry point for the current capture */
     private boolean searchClicked;
+
+    private String homePkg;
 
     @Override
     protected void onServiceConnected() {
@@ -88,8 +97,10 @@ public class MicA11yService extends AccessibilityService {
             info.flags |= AccessibilityServiceInfo.FLAG_REQUEST_FILTER_KEY_EVENTS;
             setServiceInfo(info);
         }
-        L.f(this, "service connected; flags=" + (info == null ? -1 : info.flags));
-        loadRemoteApps();
+        L.f(this, "service connected; flags=" + (info == null ? -1 : info.flags)
+                + " home=" + homePackage());
+        L.f(this, "blocklist: Jio/preset + launcher + Settings/SystemUI; allow="
+                + allowSetting());
 
         // Debug hook: adb shell am broadcast -a dev.dedsec.micbridge.TEST
         //   --es query "some text"   (deliver directly)
@@ -101,7 +112,7 @@ public class MicA11yService extends AccessibilityService {
                     String t = i.getStringExtra("target");
                     if (t == null || t.isEmpty()) t = lastApp;
                     String q = i.getStringExtra("query");
-                    L.f(MicA11yService.this, "TEST broadcast target=" + t
+                    L.f(MicA11yService.this, "TEST target=" + t
                             + " query=" + q + " blocked=" + isBlocked(t));
                     if (q != null && !q.isEmpty()) deliver(t, q);
                     else startCapture(t);
@@ -127,17 +138,33 @@ public class MicA11yService extends AccessibilityService {
             if (p == null) return;
             pkg = p.toString();
         }
-
         if (!JIO_VA.equals(pkg) && !getPackageName().equals(pkg)) {
             lastApp = pkg;
         }
 
-        if (JIO_VA.equals(pkg) && !busy
-                && !isBlocked(lastApp)
-                && System.currentTimeMillis() - lastTrigger > 3000) {
-            L.f(this, "Jio voice overlay opened over " + lastApp);
-            startCapture(lastApp);
+        long now = System.currentTimeMillis();
+        if (busy || now - lastTrigger <= 3000 || !jioOverlayPresent()) return;
+
+        // Prefer the app that was in front when the mic key went down: some
+        // launchers grab focus again while the overlay is opening, which
+        // would otherwise look like a mic press on the launcher.
+        String target = lastApp;
+        if (!keyApp.isEmpty() && now - keyAppAt <= 15000) {
+            target = keyApp;
+            keyApp = "";            // one press, one target
         }
+
+        boolean blocked = isBlocked(target);
+        if (blocked) {
+            if (now - lastBlockedLog > 3000) {
+                lastBlockedLog = now;
+                L.f(this, "voice overlay over " + target
+                        + " -> blocked, keeping stock behaviour");
+            }
+            return;
+        }
+        L.f(this, "voice overlay over " + target + " -> capturing");
+        startCapture(target);
     }
 
     @Override
@@ -146,7 +173,10 @@ public class MicA11yService extends AccessibilityService {
         if ((kc == KeyEvent.KEYCODE_VOICE_ASSIST || kc == KeyEvent.KEYCODE_SEARCH)
                 && event.getAction() == KeyEvent.ACTION_DOWN
                 && event.getRepeatCount() == 0) {
-            L.f(this, "mic key kc=" + kc + " scan=" + event.getScanCode());
+            keyApp = lastApp;
+            keyAppAt = System.currentTimeMillis();
+            L.f(this, "mic key kc=" + kc + " scan=" + event.getScanCode()
+                    + " app=" + keyApp);
         }
         return false;
     }
@@ -156,28 +186,40 @@ public class MicA11yService extends AccessibilityService {
 
     // ---- blocklist -----------------------------------------------------
 
-    private void loadRemoteApps() {
-        remoteLoaded = true;
+    private String allowSetting() {
         try {
-            String raw = Settings.Global.getString(getContentResolver(), "remote_app_list");
-            Matcher m = REMOTE_PKG.matcher(raw == null ? "" : raw);
-            while (m.find()) remoteApps.add(m.group(1));
-            L.f(this, "remote_app_list entries=" + remoteApps.size());
+            String s = Settings.Global.getString(getContentResolver(), SETTING_ALLOW);
+            return s == null ? "" : s.trim();
         } catch (Throwable t) {
-            L.e("loadRemoteApps: " + t);
+            return "";
         }
+    }
+
+    private boolean isAllowed(String pkg) {
+        String raw = allowSetting();
+        if (raw.isEmpty()) return false;
+        for (String part : raw.split("[,\\s]+")) {
+            String p = part.trim();
+            if (p.isEmpty()) continue;
+            if (p.endsWith("*")) {
+                if (pkg.startsWith(p.substring(0, p.length() - 1))) return true;
+            } else if (pkg.equals(p)) {
+                return true;
+            }
+        }
+        return false;
     }
 
     /**
      * True when the package keeps its stock mic behaviour: Jio/preset apps,
-     * the launcher, Settings, SystemUI, the voice app and ourselves.
+     * the launcher, Settings, SystemUI, the voice app and ourselves. The
+     * micbridge_allow setting always wins.
      */
     private boolean isBlocked(String pkg) {
         if (pkg == null || pkg.isEmpty()) return true;
         if (JIO_VA.equals(pkg) || getPackageName().equals(pkg)) return true;
-
-        if (!remoteLoaded) loadRemoteApps();
-        if (remoteApps.contains(pkg)) return true;
+        if (isAllowed(pkg)) return false;
+        if (pkg.equals(homePackage())) return true;
 
         for (String s : BLOCKED_EXACT) {
             if (s.equals(pkg)) return true;
@@ -185,6 +227,35 @@ public class MicA11yService extends AccessibilityService {
         for (String s : BLOCKED_PREFIX) {
             if (pkg.startsWith(s)) return true;
         }
+        return false;
+    }
+
+    private String homePackage() {
+        if (homePkg != null) return homePkg;
+        try {
+            Intent i = new Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_HOME);
+            ResolveInfo r = getPackageManager()
+                    .resolveActivity(i, PackageManager.MATCH_DEFAULT_ONLY);
+            if (r != null && r.activityInfo != null) {
+                homePkg = r.activityInfo.packageName;
+            }
+        } catch (Throwable ignored) {}
+        if (homePkg == null) homePkg = "";
+        return homePkg;
+    }
+
+    /** True when the Jio voice overlay window is on screen. */
+    private boolean jioOverlayPresent() {
+        try {
+            List<AccessibilityWindowInfo> ws = getWindows();
+            if (ws == null) return false;
+            for (AccessibilityWindowInfo w : ws) {
+                if (w == null || w.getType() != AccessibilityWindowInfo.TYPE_APPLICATION) continue;
+                AccessibilityNodeInfo r = w.getRoot();
+                if (r == null) continue;
+                if (JIO_VA.contentEquals(String.valueOf(r.getPackageName()))) return true;
+            }
+        } catch (Throwable ignored) {}
         return false;
     }
 
@@ -305,7 +376,7 @@ public class MicA11yService extends AccessibilityService {
 
     private void deliverToApp(final String target, final String text, final int tries) {
         String top = activeAppPackage();
-        L.i("deliverToApp try=" + tries + " top=" + top);
+        L.i("deliverToApp try=" + tries + " top=" + top + " target=" + target);
 
         if (JIO_VA.equals(top)) {
             if (tries < 4) {
@@ -336,44 +407,19 @@ public class MicA11yService extends AccessibilityService {
             return;
         }
 
-        // SmartTube's search box is a StreamingTextView (not editable) and its
-        // search screen is a separate window, so it needs its own path first.
-        if (SMARTTUBE.equals(target)) {
-            AccessibilityNodeInfo edit = byId(root, ID_ST_SEARCH_EDIT);
-            if (edit != null) {
-                if (setText(edit, text)) {
-                    L.f(this, "typed into SmartTube search: " + text);
-                    busy = false;
-                } else if (tries < 5) {
-                    h.postDelayed(() -> deliverToApp(target, text, tries + 1), 400);
-                } else {
-                    busy = false;
-                }
-                return;
-            }
-            AccessibilityNodeInfo orb = byId(root, ID_ST_SEARCH_ORB);
-            if (orb == null) orb = byDesc(root, "Search Action");
-            if (orb != null && tries < 5) {
-                L.f(this, "opening SmartTube search screen");
-                searchClicked = true;
-                click(orb);
-                h.postDelayed(() -> deliverToApp(target, text, tries + 1), 900);
-                return;
-            }
-        }
+        AccessibilityNodeInfo field = focusedEditable(root);
+        if (field == null) field = firstEditable(root);
+        if (field == null) field = findLeanbackField(root, 0);
 
-        // Generic path: focused field, then any field, then a search entry
-        // point, then give up quietly.
-        AccessibilityNodeInfo edit = focusedEditable(root);
-        if (edit == null) edit = firstEditable(root);
-        if (edit != null) {
-            if (setText(edit, text)) {
-                L.f(this, "typed into " + target + ": " + text);
+        if (field != null) {
+            if (typeInto(field, text)) {
+                L.f(this, "typed into " + target + " (" + nodeName(field) + "): " + text);
                 busy = false;
             } else if (tries < 5) {
-                h.postDelayed(() -> deliverToApp(target, text, tries + 1), 400);
+                L.f(this, "could not type into " + nodeName(field) + "; retrying");
+                h.postDelayed(() -> deliverToApp(target, text, tries + 1), 450);
             } else {
-                L.f(this, "could not type into " + target);
+                L.f(this, "could not type into " + nodeName(field));
                 busy = false;
             }
             return;
@@ -383,7 +429,7 @@ public class MicA11yService extends AccessibilityService {
             AccessibilityNodeInfo s = findSearch(root);
             if (s != null) {
                 searchClicked = true;
-                L.f(this, "opening search in " + target);
+                L.f(this, "opening search in " + target + " via " + nodeName(s));
                 click(s);
                 h.postDelayed(() -> deliverToApp(target, text, tries + 1), 900);
                 return;
@@ -393,7 +439,11 @@ public class MicA11yService extends AccessibilityService {
         if (tries < 5) {
             h.postDelayed(() -> deliverToApp(target, text, tries + 1), 600);
         } else {
-            L.f(this, "no destination in " + target + "; nothing typed");
+            AccessibilityNodeInfo focus = null;
+            try { focus = root.findFocus(AccessibilityNodeInfo.FOCUS_INPUT); }
+            catch (Throwable ignored) {}
+            L.f(this, "no text field in " + target
+                    + " (focus=" + nodeName(focus) + "); nothing typed");
             busy = false;
         }
     }
@@ -469,10 +519,35 @@ public class MicA11yService extends AccessibilityService {
     }
 
     /**
-     * Node that looks like the app's search entry point, or null. Walks the
-     * tree because findAccessibilityNodeInfosByText ignores content
-     * descriptions, which is where most TV apps put "Search".
+     * Leanback search boxes (SmartTube, TizenTube, ...) are streaming text
+     * views rather than editable fields, so they need their own lookup.
      */
+    private AccessibilityNodeInfo findLeanbackField(AccessibilityNodeInfo n, int depth) {
+        if (n == null || depth > 30) return null;
+        try {
+            CharSequence cls = n.getClassName();
+            String c = cls == null ? "" : cls.toString();
+            if (c.contains("StreamingTextView") || c.contains("SearchEditText")) return n;
+
+            String id = null;
+            try { id = n.getViewIdResourceName(); } catch (Throwable ignored) {}
+            if (id != null) {
+                String low = id.toLowerCase(Locale.US);
+                if (low.contains("search_text") || low.endsWith("search_editor")
+                        || low.endsWith("search_box") || low.endsWith("search_field")) {
+                    return n;
+                }
+            }
+
+            for (int i = 0; i < n.getChildCount(); i++) {
+                AccessibilityNodeInfo r = findLeanbackField(n.getChild(i), depth + 1);
+                if (r != null) return r;
+            }
+        } catch (Throwable ignored) {}
+        return null;
+    }
+
+    /** Node that looks like the app's search entry point, or null. */
     private AccessibilityNodeInfo findSearch(AccessibilityNodeInfo root) {
         return findSearch(root, 0);
     }
@@ -480,6 +555,10 @@ public class MicA11yService extends AccessibilityService {
     private AccessibilityNodeInfo findSearch(AccessibilityNodeInfo n, int depth) {
         if (n == null || depth > 25) return null;
         try {
+            // Never click around inside web page content (TV Bro & co): only
+            // the app's own chrome can be a search entry point.
+            CharSequence cls = n.getClassName();
+            if (cls != null && cls.toString().contains("WebView")) return null;
             if (mentionsSearch(n.getText()) || mentionsSearch(n.getContentDescription())) {
                 return n;
             }
@@ -501,6 +580,14 @@ public class MicA11yService extends AccessibilityService {
         if (t != null) t.performAction(AccessibilityNodeInfo.ACTION_CLICK);
     }
 
+    /** Focus/click the field first, then set the text. */
+    private boolean typeInto(AccessibilityNodeInfo node, String text) {
+        if (setText(node, text)) return true;
+        try { node.performAction(AccessibilityNodeInfo.ACTION_CLICK); } catch (Throwable ignored) {}
+        node.performAction(AccessibilityNodeInfo.ACTION_FOCUS);
+        return setText(node, text);
+    }
+
     private boolean setText(AccessibilityNodeInfo node, String text) {
         Bundle b = new Bundle();
         b.putCharSequence(AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE, text);
@@ -511,5 +598,19 @@ public class MicA11yService extends AccessibilityService {
         }
         L.f(this, "ACTION_SET_TEXT ok=" + ok);
         return ok;
+    }
+
+    /** Short "Class#id" form for logs. */
+    private String nodeName(AccessibilityNodeInfo n) {
+        if (n == null) return "null";
+        String cls = String.valueOf(n.getClassName());
+        int dot = cls.lastIndexOf('.');
+        String id = null;
+        try { id = n.getViewIdResourceName(); } catch (Throwable ignored) {}
+        if (id != null) {
+            int s = id.indexOf(":id/");
+            if (s >= 0) id = id.substring(s + 4);
+        }
+        return (dot >= 0 ? cls.substring(dot + 1) : cls) + (id == null ? "" : "#" + id);
     }
 }
