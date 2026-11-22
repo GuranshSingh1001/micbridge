@@ -26,8 +26,8 @@ import java.util.Locale;
  * The firmware always launches com.android.app.jio.voiceassist for the mic
  * key and that app is the only client the speech service accepts, so this
  * service lets it do the recognition, reads the recognised query from
- * voiceStatesView, closes the overlay and types the text into the app that
- * was in the foreground.
+ * voiceStatesView (or fallback views/text hierarchy), closes the overlay,
+ * and types the text into the app that was in the foreground.
  *
  * Routing is global. Only Jio/preset apps, the current launcher, Settings and
  * SystemUI keep their stock behaviour. A package can always be forced back
@@ -37,11 +37,47 @@ import java.util.Locale;
  */
 public class MicA11yService extends AccessibilityService {
 
-    static final String JIO_VA = "com.android.app.jio.voiceassist";
-    static final String ID_VOICE_STATE = JIO_VA + ":id/voiceStatesView";
+    public static final String JIO_VA = "com.android.app.jio.voiceassist";
+    public static final String ID_VOICE_STATE = JIO_VA + ":id/voiceStatesView";
+
+    /** Known candidate IDs used by different versions of Jio Voice Assist */
+    private static final String[] CANDIDATE_VIEW_IDS = {
+            ID_VOICE_STATE,
+            JIO_VA + ":id/tv_speech_result",
+            JIO_VA + ":id/text_result",
+            JIO_VA + ":id/tv_voice_state",
+            JIO_VA + ":id/voice_query",
+            JIO_VA + ":id/query",
+            JIO_VA + ":id/title",
+            JIO_VA + ":id/sub_title",
+            JIO_VA + ":id/prompt_text",
+            JIO_VA + ":id/search_query"
+    };
+
+    /** Candidate IDs that indicate the final recognition / result screen */
+    private static final String[] FINAL_UI_IDS = {
+            JIO_VA + ":id/banner_layout",
+            JIO_VA + ":id/title",
+            JIO_VA + ":id/search_result",
+            JIO_VA + ":id/rv_search_results",
+            JIO_VA + ":id/card_view",
+            JIO_VA + ":id/result_container"
+    };
+
+    /** Callback interface for RecognizeActivity to receive results */
+    public interface QueryListener {
+        void onQueryCaptured(String query);
+        void onCaptureFailed();
+    }
+
+    private static volatile QueryListener sQueryListener;
+
+    public static void setQueryListener(QueryListener listener) {
+        sQueryListener = listener;
+    }
 
     /** Comma/space separated allowlist, supports a trailing "*" wildcard. */
-    static final String SETTING_ALLOW = "micbridge_allow";
+    public static final String SETTING_ALLOW = "micbridge_allow";
 
     /** Packages that always keep the stock Jio mic behaviour. */
     private static final String[] BLOCKED_EXACT = {
@@ -51,7 +87,6 @@ public class MicA11yService extends AccessibilityService {
             "com.android.tv.settings",
             "com.android.tv.settings.local",
             "com.klevico.monet",
-            "com.gathin.tvhome",
             "in.startv.hotstar",
             "com.netflix.ninja",
             "com.amazon.amazonvideo.livingroom",
@@ -60,13 +95,14 @@ public class MicA11yService extends AccessibilityService {
             "com.hoichoi.mitv",
             "com.epicchannel.epicon",
             "com.ultrajhakaas.android",
-            "com.etvwin.androidtv",
+            "com.etvwin.androidtv"
     };
+
     private static final String[] BLOCKED_PREFIX = {
             "com.iwedia.",
             "com.jio.",
             "com.jiostb.",
-            "com.jiotv.",
+            "com.jiotv."
     };
 
     private final Handler h = new Handler(Looper.getMainLooper());
@@ -94,7 +130,14 @@ public class MicA11yService extends AccessibilityService {
         super.onServiceConnected();
         AccessibilityServiceInfo info = getServiceInfo();
         if (info != null) {
-            info.flags |= AccessibilityServiceInfo.FLAG_REQUEST_FILTER_KEY_EVENTS;
+            info.flags |= AccessibilityServiceInfo.FLAG_REQUEST_FILTER_KEY_EVENTS
+                    | AccessibilityServiceInfo.FLAG_RETRIEVE_INTERACTIVE_WINDOWS
+                    | AccessibilityServiceInfo.FLAG_REPORT_VIEW_IDS
+                    | AccessibilityServiceInfo.FLAG_INCLUDE_NOT_IMPORTANT_VIEWS;
+            info.eventTypes |= AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED
+                    | AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED
+                    | AccessibilityEvent.TYPE_VIEW_FOCUSED
+                    | AccessibilityEvent.TYPE_WINDOWS_CHANGED;
             setServiceInfo(info);
         }
         L.f(this, "service connected; flags=" + (info == null ? -1 : info.flags)
@@ -127,32 +170,33 @@ public class MicA11yService extends AccessibilityService {
     public void onAccessibilityEvent(AccessibilityEvent event) {
         if (event == null) return;
         int type = event.getEventType();
+
+        CharSequence ep = event.getPackageName();
+        String eventPkg = ep != null ? ep.toString() : null;
+
+        // Keep track of the active foreground app
+        if (eventPkg != null && !JIO_VA.equals(eventPkg) && !getPackageName().equals(eventPkg)) {
+            if (type == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED
+                    || type == AccessibilityEvent.TYPE_WINDOWS_CHANGED
+                    || type == AccessibilityEvent.TYPE_VIEW_FOCUSED) {
+                lastApp = eventPkg;
+            }
+        }
+
+        // We act on window state/hierarchy changes, or any event from Jio VA
+        boolean isJioEvent = (eventPkg != null && JIO_VA.equals(eventPkg));
         if (type != AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED
-                && type != AccessibilityEvent.TYPE_WINDOWS_CHANGED) {
+                && type != AccessibilityEvent.TYPE_WINDOWS_CHANGED
+                && !isJioEvent) {
             return;
         }
 
-        String pkg = activeAppPackage();
-        if (pkg == null) {
-            CharSequence p = event.getPackageName();
-            if (p == null) return;
-            pkg = p.toString();
-        }
-        if (!JIO_VA.equals(pkg) && !getPackageName().equals(pkg)) {
-            lastApp = pkg;
-        }
-
         long now = System.currentTimeMillis();
-        if (busy || now - lastTrigger <= 3000 || !jioOverlayPresent()) return;
+        if (busy || (now - lastTrigger <= 2500) || !jioOverlayPresent()) return;
 
-        // Prefer the app that was in front when the mic key went down: some
-        // launchers grab focus again while the overlay is opening, which
-        // would otherwise look like a mic press on the launcher.
-        String target = lastApp;
-        if (!keyApp.isEmpty() && now - keyAppAt <= 15000) {
-            target = keyApp;
-            keyApp = "";            // one press, one target
-        }
+        // Target resolution
+        String target = resolveTarget(now);
+        if (target == null || target.isEmpty()) return;
 
         boolean blocked = isBlocked(target);
         if (blocked) {
@@ -167,22 +211,66 @@ public class MicA11yService extends AccessibilityService {
         startCapture(target);
     }
 
+    private String resolveTarget(long now) {
+        String target = lastApp;
+        if (!keyApp.isEmpty() && now - keyAppAt <= 15000) {
+            target = keyApp;
+            keyApp = ""; // one press, one target
+        }
+        if (target.isEmpty() || JIO_VA.equals(target) || getPackageName().equals(target)) {
+            String act = activeAppPackage();
+            if (act != null && !act.isEmpty()) target = act;
+        }
+        return target;
+    }
+
     @Override
     public boolean onKeyEvent(KeyEvent event) {
         int kc = event.getKeyCode();
-        if ((kc == KeyEvent.KEYCODE_VOICE_ASSIST || kc == KeyEvent.KEYCODE_SEARCH)
-                && event.getAction() == KeyEvent.ACTION_DOWN
+        int scan = event.getScanCode();
+
+        boolean isMicKey = (kc == KeyEvent.KEYCODE_VOICE_ASSIST
+                || kc == KeyEvent.KEYCODE_SEARCH
+                || kc == KeyEvent.KEYCODE_ASSIST
+                || scan == 217
+                || scan == 218
+                || scan == 240);
+
+        if (isMicKey && event.getAction() == KeyEvent.ACTION_DOWN
                 && event.getRepeatCount() == 0) {
-            // Ask for the focused app right now instead of trusting the last
-            // window event: some boxes/apps do not emit state changes.
             String front = activeAppPackage();
             keyApp = (front != null && !JIO_VA.equals(front)
                     && !getPackageName().equals(front)) ? front : lastApp;
             keyAppAt = System.currentTimeMillis();
-            L.f(this, "mic key kc=" + kc + " scan=" + event.getScanCode()
-                    + " app=" + keyApp);
+            L.f(this, "mic key kc=" + kc + " scan=" + scan + " app=" + keyApp);
+
+            // Proactively watch for Jio Voice Assist overlay appearing
+            watchForOverlay(keyApp, 0);
         }
         return false;
+    }
+
+    /**
+     * Poll briefly after a mic key event in case window state change is dropped by the system
+     */
+    private void watchForOverlay(final String target, final int attempt) {
+        if (busy || attempt > 8) return;
+        h.postDelayed(() -> {
+            if (busy) return;
+            if (jioOverlayPresent()) {
+                long now = System.currentTimeMillis();
+                if (now - lastTrigger > 2500) {
+                    if (isBlocked(target)) {
+                        L.f(MicA11yService.this, "voice overlay over " + target + " (watched) -> blocked");
+                    } else {
+                        L.f(MicA11yService.this, "voice overlay over " + target + " (watched) -> capturing");
+                        startCapture(target);
+                    }
+                }
+            } else {
+                watchForOverlay(target, attempt + 1);
+            }
+        }, attempt == 0 ? 150 : 250);
     }
 
     @Override
@@ -250,22 +338,12 @@ public class MicA11yService extends AccessibilityService {
 
     /** True when the Jio voice overlay window is on screen. */
     private boolean jioOverlayPresent() {
-        try {
-            List<AccessibilityWindowInfo> ws = getWindows();
-            if (ws == null) return false;
-            for (AccessibilityWindowInfo w : ws) {
-                if (w == null || w.getType() != AccessibilityWindowInfo.TYPE_APPLICATION) continue;
-                AccessibilityNodeInfo r = w.getRoot();
-                if (r == null) continue;
-                if (JIO_VA.contentEquals(String.valueOf(r.getPackageName()))) return true;
-            }
-        } catch (Throwable ignored) {}
-        return false;
+        return jioRoot() != null;
     }
 
     // ---- query capture -------------------------------------------------
 
-    private void startCapture(String target) {
+    public void startCapture(String target) {
         busy = true;
         lastTrigger = System.currentTimeMillis();
         lastQuery = null;
@@ -275,17 +353,25 @@ public class MicA11yService extends AccessibilityService {
     }
 
     private void poll(final String target, final int tick) {
-        if (tick > 90) {          // ~27 s
+        if (tick > 90) { // ~27 s
             L.f(this, "capture timeout");
             busy = false;
+            notifyListenerFailed();
             return;
         }
 
-        String top = activeAppPackage();
-        if (!JIO_VA.equals(top)) {
-            if (tick > 2) {
-                L.f(this, "overlay closed before a query appeared (top=" + top + ")");
+        boolean overlayPresent = jioOverlayPresent();
+        if (!overlayPresent) {
+            // If the overlay closed and we already had a captured query, deliver it!
+            if (lastQuery != null && !lastQuery.isEmpty()) {
+                L.f(this, "overlay closed with query: \"" + lastQuery + "\" -> delivering");
+                deliver(target, lastQuery);
+                return;
+            }
+            if (tick > 3) {
+                L.f(this, "overlay closed before a query appeared");
                 busy = false;
+                notifyListenerFailed();
                 return;
             }
         } else {
@@ -297,10 +383,8 @@ public class MicA11yService extends AccessibilityService {
                     lastQuery = q;
                     stableCount = 0;
                 }
-                // The result screen carries a banner/title; prefer that, and
-                // fall back to a text that stayed unchanged for ~600 ms.
-                boolean finalUi = hasId(JIO_VA + ":id/banner_layout")
-                        || hasId(JIO_VA + ":id/title");
+
+                boolean finalUi = isFinalUi();
                 if ((finalUi && stableCount >= 1) || stableCount >= 2) {
                     L.f(this, "captured query: \"" + q + "\" (finalUi=" + finalUi + ")");
                     deliver(target, q);
@@ -311,20 +395,72 @@ public class MicA11yService extends AccessibilityService {
         h.postDelayed(() -> poll(target, tick + 1), 300);
     }
 
+    private boolean isFinalUi() {
+        for (String id : FINAL_UI_IDS) {
+            if (hasId(id)) return true;
+        }
+        return false;
+    }
+
     /** Reads the recognised query out of the Jio overlay, or null. */
     private String readQuery() {
         try {
             AccessibilityNodeInfo root = jioRoot();
             if (root == null) return null;
-            List<AccessibilityNodeInfo> l = root.findAccessibilityNodeInfosByViewId(ID_VOICE_STATE);
-            if (l == null || l.isEmpty()) return null;
-            CharSequence t = l.get(0).getText();
-            if (t == null) return null;
-            String s = t.toString().trim();
-            if (!plausibleQuery(s)) return null;
-            return s;
+
+            // 1. Check known candidate IDs
+            for (String id : CANDIDATE_VIEW_IDS) {
+                List<AccessibilityNodeInfo> l = root.findAccessibilityNodeInfosByViewId(id);
+                if (l != null && !l.isEmpty()) {
+                    for (AccessibilityNodeInfo n : l) {
+                        String s = extractNodeText(n);
+                        if (s != null && plausibleQuery(s)) return s;
+                    }
+                }
+            }
+
+            // 2. Fallback: Search all text in the Jio overlay for plausible query text
+            return findPlausibleText(root, 0);
         } catch (Throwable t) {
             L.e("readQuery: " + t);
+        }
+        return null;
+    }
+
+    private String extractNodeText(AccessibilityNodeInfo node) {
+        if (node == null) return null;
+        CharSequence t = node.getText();
+        if (t != null && t.length() > 0) {
+            String s = t.toString().trim();
+            if (!s.isEmpty()) return s;
+        }
+        CharSequence d = node.getContentDescription();
+        if (d != null && d.length() > 0) {
+            String s = d.toString().trim();
+            if (!s.isEmpty()) return s;
+        }
+        for (int i = 0; i < node.getChildCount(); i++) {
+            String c = extractNodeText(node.getChild(i));
+            if (c != null && !c.isEmpty()) return c;
+        }
+        return null;
+    }
+
+    private String findPlausibleText(AccessibilityNodeInfo n, int depth) {
+        if (n == null || depth > 20) return null;
+        CharSequence t = n.getText();
+        if (t != null) {
+            String s = t.toString().trim();
+            if (plausibleQuery(s)) return s;
+        }
+        CharSequence d = n.getContentDescription();
+        if (d != null) {
+            String s = d.toString().trim();
+            if (plausibleQuery(s)) return s;
+        }
+        for (int i = 0; i < n.getChildCount(); i++) {
+            String r = findPlausibleText(n.getChild(i), depth + 1);
+            if (r != null) return r;
         }
         return null;
     }
@@ -332,13 +468,20 @@ public class MicA11yService extends AccessibilityService {
     private AccessibilityNodeInfo jioRoot() {
         try {
             List<AccessibilityWindowInfo> ws = getWindows();
-            if (ws == null) return null;
-            for (AccessibilityWindowInfo w : ws) {
-                if (w == null || w.getType() != AccessibilityWindowInfo.TYPE_APPLICATION) continue;
-                AccessibilityNodeInfo root = w.getRoot();
-                if (root == null) continue;
-                if (!JIO_VA.contentEquals(String.valueOf(root.getPackageName()))) continue;
-                return root;
+            if (ws != null) {
+                for (AccessibilityWindowInfo w : ws) {
+                    if (w == null) continue;
+                    AccessibilityNodeInfo root = w.getRoot();
+                    if (root == null || root.getPackageName() == null) continue;
+                    if (JIO_VA.contentEquals(root.getPackageName())) return root;
+                }
+            }
+        } catch (Throwable ignored) {}
+        try {
+            AccessibilityNodeInfo active = getRootInActiveWindow();
+            if (active != null && active.getPackageName() != null
+                    && JIO_VA.contentEquals(active.getPackageName())) {
+                return active;
             }
         } catch (Throwable ignored) {}
         return null;
@@ -356,16 +499,17 @@ public class MicA11yService extends AccessibilityService {
     }
 
     private boolean plausibleQuery(String s) {
-        if (s.length() < 2) return false;
+        if (s == null || s.length() < 2) return false;
         String l = s.toLowerCase(Locale.US);
-        if (l.contains("listening")) return false;
+        if (l.contains("listening") || l.contains("speak now") || l.contains("say something")) return false;
         if (l.equals("on") || l.equals("off")
-                || l.equals("try again") || l.equals("…") || l.equals("...")) {
+                || l.equals("try again") || l.equals("…") || l.equals("...") || l.equals("mic")) {
             return false;
         }
         String[] bad = {"sorry", "didn't", "did not", "not able", "no result",
                 "something went wrong", "could not", "couldn't", "try saying",
-                "network", "please try"};
+                "network", "please try", "tap to speak", "google assistant",
+                "voice assistant", "hello jio"};
         for (String b : bad) {
             if (l.contains(b)) return false;
         }
@@ -375,18 +519,43 @@ public class MicA11yService extends AccessibilityService {
     // ---- delivery ------------------------------------------------------
 
     private void deliver(final String target, final String text) {
+        // If RecognizeActivity is active, deliver to it directly
+        QueryListener ql = sQueryListener;
+        if (ql != null) {
+            sQueryListener = null;
+            ql.onQueryCaptured(text);
+            busy = false;
+            dismissOverlayIfNeeded();
+            return;
+        }
+
         h.postDelayed(() -> deliverToApp(target, text, 0), 100);
     }
 
-    private void deliverToApp(final String target, final String text, final int tries) {
-        String top = activeAppPackage();
-        L.i("deliverToApp try=" + tries + " top=" + top + " target=" + target);
+    private void notifyListenerFailed() {
+        QueryListener ql = sQueryListener;
+        if (ql != null) {
+            sQueryListener = null;
+            ql.onCaptureFailed();
+        }
+    }
 
-        if (JIO_VA.equals(top)) {
-            if (tries < 4) {
+    private void dismissOverlayIfNeeded() {
+        if (jioOverlayPresent()) {
+            performGlobalAction(GLOBAL_ACTION_BACK);
+        }
+    }
+
+    private void deliverToApp(final String target, final String text, final int tries) {
+        String top = topPackage();
+        boolean overlayStillUp = jioOverlayPresent() || (top != null && JIO_VA.equals(top));
+        L.i("deliverToApp try=" + tries + " top=" + top + " target=" + target + " overlay=" + overlayStillUp);
+
+        if (overlayStillUp) {
+            if (tries < 5) {
                 L.f(this, "dismissing Jio overlay");
                 performGlobalAction(GLOBAL_ACTION_BACK);
-                h.postDelayed(() -> deliverToApp(target, text, tries + 1), 500);
+                h.postDelayed(() -> deliverToApp(target, text, tries + 1), 400);
             } else {
                 L.f(this, "could not dismiss Jio overlay");
                 busy = false;
@@ -394,11 +563,12 @@ public class MicA11yService extends AccessibilityService {
             return;
         }
 
-        if (top == null || !top.equals(target)) {
+        String activePkg = activeAppPackage();
+        if (activePkg != null && !activePkg.equals(target)) {
             if (tries < 5) {
-                h.postDelayed(() -> deliverToApp(target, text, tries + 1), 500);
+                h.postDelayed(() -> deliverToApp(target, text, tries + 1), 400);
             } else {
-                L.f(this, "target never came to front (" + target + ")");
+                L.f(this, "target never came to front (" + target + ", active=" + activePkg + ")");
                 busy = false;
             }
             return;
@@ -406,7 +576,7 @@ public class MicA11yService extends AccessibilityService {
 
         AccessibilityNodeInfo root = getRootInActiveWindow();
         if (root == null) {
-            if (tries < 5) h.postDelayed(() -> deliverToApp(target, text, tries + 1), 500);
+            if (tries < 5) h.postDelayed(() -> deliverToApp(target, text, tries + 1), 400);
             else busy = false;
             return;
         }
@@ -421,7 +591,7 @@ public class MicA11yService extends AccessibilityService {
                 busy = false;
             } else if (tries < 5) {
                 L.f(this, "could not type into " + nodeName(field) + "; retrying");
-                h.postDelayed(() -> deliverToApp(target, text, tries + 1), 450);
+                h.postDelayed(() -> deliverToApp(target, text, tries + 1), 400);
             } else {
                 L.f(this, "could not type into " + nodeName(field));
                 busy = false;
@@ -435,13 +605,13 @@ public class MicA11yService extends AccessibilityService {
                 searchClicked = true;
                 L.f(this, "opening search in " + target + " via " + nodeName(s));
                 click(s);
-                h.postDelayed(() -> deliverToApp(target, text, tries + 1), 900);
+                h.postDelayed(() -> deliverToApp(target, text, tries + 1), 800);
                 return;
             }
         }
 
         if (tries < 5) {
-            h.postDelayed(() -> deliverToApp(target, text, tries + 1), 600);
+            h.postDelayed(() -> deliverToApp(target, text, tries + 1), 500);
         } else {
             AccessibilityNodeInfo focus = null;
             try { focus = root.findFocus(AccessibilityNodeInfo.FOCUS_INPUT); }
@@ -454,38 +624,50 @@ public class MicA11yService extends AccessibilityService {
 
     // ---- helpers -------------------------------------------------------
 
+    private String topPackage() {
+        try {
+            List<AccessibilityWindowInfo> ws = getWindows();
+            if (ws != null) {
+                for (AccessibilityWindowInfo w : ws) {
+                    if (w == null) continue;
+                    AccessibilityNodeInfo r = w.getRoot();
+                    if (r == null || r.getPackageName() == null) continue;
+                    if (w.isFocused() || w.isActive()) return r.getPackageName().toString();
+                }
+            }
+        } catch (Throwable ignored) {}
+        try {
+            AccessibilityNodeInfo r = getRootInActiveWindow();
+            if (r != null && r.getPackageName() != null) return r.getPackageName().toString();
+        } catch (Throwable ignored) {}
+        return null;
+    }
+
     private String activeAppPackage() {
         try {
             List<AccessibilityWindowInfo> ws = getWindows();
-            if (ws == null) return null;
-            String best = null;
-            for (AccessibilityWindowInfo w : ws) {
-                if (w == null || w.getType() != AccessibilityWindowInfo.TYPE_APPLICATION) continue;
-                AccessibilityNodeInfo r = w.getRoot();
-                if (r == null || r.getPackageName() == null) continue;
+            if (ws != null) {
+                String best = null;
+                for (AccessibilityWindowInfo w : ws) {
+                    if (w == null) continue;
+                    AccessibilityNodeInfo r = w.getRoot();
+                    if (r == null || r.getPackageName() == null) continue;
+                    String p = r.getPackageName().toString();
+                    if (JIO_VA.equals(p) || getPackageName().equals(p)) continue;
+                    if (w.isFocused() || w.isActive()) return p;
+                    if (best == null) best = p;
+                }
+                if (best != null) return best;
+            }
+        } catch (Throwable ignored) {}
+        try {
+            AccessibilityNodeInfo r = getRootInActiveWindow();
+            if (r != null && r.getPackageName() != null) {
                 String p = r.getPackageName().toString();
-                if (w.isFocused() || w.isActive()) return p;
-                if (best == null) best = p;
+                if (!JIO_VA.equals(p) && !getPackageName().equals(p)) return p;
             }
-            return best;
-        } catch (Throwable t) {
-            return null;
-        }
-    }
-
-    private AccessibilityNodeInfo byId(AccessibilityNodeInfo root, String id) {
-        List<AccessibilityNodeInfo> l = root.findAccessibilityNodeInfosByViewId(id);
-        return (l != null && !l.isEmpty()) ? l.get(0) : null;
-    }
-
-    private AccessibilityNodeInfo byDesc(AccessibilityNodeInfo root, String desc) {
-        List<AccessibilityNodeInfo> l = root.findAccessibilityNodeInfosByText(desc);
-        if (l != null) {
-            for (AccessibilityNodeInfo n : l) {
-                if (desc.contentEquals(String.valueOf(n.getContentDescription()))) return n;
-            }
-        }
-        return null;
+        } catch (Throwable ignored) {}
+        return lastApp;
     }
 
     /** Editable node that currently holds input focus, or null. */
@@ -523,8 +705,7 @@ public class MicA11yService extends AccessibilityService {
     }
 
     /**
-     * Leanback search boxes (SmartTube, TizenTube, ...) are streaming text
-     * views rather than editable fields, so they need their own lookup.
+     * Search boxes (SmartTube, Leanback, SearchView, etc.)
      */
     private AccessibilityNodeInfo findLeanbackField(AccessibilityNodeInfo n, int depth) {
         if (n == null || depth > 30) return null;
@@ -537,8 +718,9 @@ public class MicA11yService extends AccessibilityService {
             try { id = n.getViewIdResourceName(); } catch (Throwable ignored) {}
             if (id != null) {
                 String low = id.toLowerCase(Locale.US);
-                if (low.contains("search_text") || low.endsWith("search_editor")
-                        || low.endsWith("search_box") || low.endsWith("search_field")) {
+                if (low.contains("search") && (low.contains("text") || low.contains("editor")
+                        || low.contains("box") || low.contains("field") || low.contains("src")
+                        || low.contains("input") || low.contains("query") || low.contains("bar"))) {
                     return n;
                 }
             }
@@ -559,8 +741,6 @@ public class MicA11yService extends AccessibilityService {
     private AccessibilityNodeInfo findSearch(AccessibilityNodeInfo n, int depth) {
         if (n == null || depth > 25) return null;
         try {
-            // Never click around inside web page content (TV Bro & co): only
-            // the app's own chrome can be a search entry point.
             CharSequence cls = n.getClassName();
             if (cls != null && cls.toString().contains("WebView")) return null;
             if (mentionsSearch(n.getText()) || mentionsSearch(n.getContentDescription())) {

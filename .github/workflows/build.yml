@@ -1,0 +1,51 @@
+name: Build MicBridge APK
+
+on:
+  push:
+    branches: [ "main", "master" ]
+    tags: [ "v*" ]
+  pull_request:
+    branches: [ "main", "master" ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Build & Release APK
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Java JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android Platform 30 & Build-Tools
+        run: |
+          yes | sdkmanager --licenses || true
+          sdkmanager "platforms;android-30" "build-tools;30.0.3"
+
+      - name: Build APK via build.sh
+        run: |
+          chmod +x build.sh
+          ./build.sh
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: micbridge-apk
+          path: micbridge.apk
+          if-no-files-found: error
+
+      - name: Create Release on GitHub
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: micbridge.apk
+          generate_release_notes: true

@@ -1,6 +1,7 @@
 package dev.dedsec.micbridge;
 
 import android.app.Activity;
+import android.content.ComponentName;
 import android.content.Intent;
 import android.graphics.Color;
 import android.os.Bundle;
@@ -17,10 +18,11 @@ import java.util.ArrayList;
 
 /**
  * Device-wide handler for RecognizerIntent.ACTION_RECOGNIZE_SPEECH.
- * This firmware ships no such activity, which is why SmartTube's own
- * microphone button fails with "Could not find voice search activity".
+ * Intercepts voice search intent from apps like SmartTube, routes
+ * to Jio Voice Assistant (or system recognizer), and returns the
+ * captured speech text to the calling application.
  */
-public class RecognizeActivity extends Activity implements RecognitionListener {
+public class RecognizeActivity extends Activity implements RecognitionListener, MicA11yService.QueryListener {
 
     private static final String TAG = "MicBridge";
 
@@ -51,11 +53,59 @@ public class RecognizeActivity extends Activity implements RecognitionListener {
         getWindow().setLayout(ViewGroup.LayoutParams.MATCH_PARENT,
                 ViewGroup.LayoutParams.MATCH_PARENT);
 
-        try {
-            if (sr != null) sr.destroy();
-            if (!SpeechRecognizer.isRecognitionAvailable(this)) {
-                L.f(this, "RecognizeActivity: no recognizer");
+        // Register callback with our accessibility service
+        MicA11yService.setQueryListener(this);
+
+        boolean launchedJio = tryLaunchJioVoice();
+        if (!launchedJio) {
+            startNativeRecognizer();
+        }
+
+        h.postDelayed(() -> {
+            if (!done) {
+                L.f(this, "RecognizeActivity timeout");
                 finishCancelled();
+            }
+        }, 15000);
+    }
+
+    private boolean tryLaunchJioVoice() {
+        try {
+            // First attempt: direct component launch for Jio Voice Assistant
+            Intent i = new Intent();
+            i.setComponent(new ComponentName(MicA11yService.JIO_VA,
+                    "com.android.app.jio.voiceassist.search.modified.ui.MainActivity"));
+            i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+            startActivity(i);
+            L.f(this, "RecognizeActivity: launched Jio VA via component");
+            return true;
+        } catch (Throwable t1) {
+            try {
+                Intent launch = getPackageManager().getLaunchIntentForPackage(MicA11yService.JIO_VA);
+                if (launch != null) {
+                    launch.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+                    startActivity(launch);
+                    L.f(this, "RecognizeActivity: launched Jio VA via launch intent");
+                    return true;
+                }
+            } catch (Throwable t2) {
+                try {
+                    Intent assist = new Intent(Intent.ACTION_ASSIST);
+                    assist.setPackage(MicA11yService.JIO_VA);
+                    assist.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+                    startActivity(assist);
+                    L.f(this, "RecognizeActivity: launched Jio VA via assist intent");
+                    return true;
+                } catch (Throwable ignored) {}
+            }
+        }
+        return false;
+    }
+
+    private void startNativeRecognizer() {
+        try {
+            if (!SpeechRecognizer.isRecognitionAvailable(this)) {
+                L.f(this, "RecognizeActivity: no recognizer available");
                 return;
             }
             sr = SpeechRecognizer.createSpeechRecognizer(this);
@@ -73,25 +123,28 @@ public class RecognizeActivity extends Activity implements RecognitionListener {
                             : "en-IN");
             i.putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, false);
             i.putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 5);
-            i.putExtra("isGB", true);
             sr.startListening(i);
-            L.f(this, "RecognizeActivity started listening");
-
-            h.postDelayed(() -> {
-                if (!done) {
-                    L.f(this, "RecognizeActivity timeout");
-                    finishCancelled();
-                }
-            }, 15000);
+            L.f(this, "RecognizeActivity: started native listening");
         } catch (Throwable t) {
-            L.f(this, "RecognizeActivity failed: " + t);
-            finishCancelled();
+            L.f(this, "RecognizeActivity native fallback failed: " + t);
         }
+    }
+
+    @Override
+    public void onQueryCaptured(String query) {
+        L.f(this, "RecognizeActivity captured via A11yService: " + query);
+        finishWith(query);
+    }
+
+    @Override
+    public void onCaptureFailed() {
+        finishCancelled();
     }
 
     private void finishCancelled() {
         if (done) return;
         done = true;
+        MicA11yService.setQueryListener(null);
         setResult(RESULT_CANCELED);
         finish();
     }
@@ -99,6 +152,7 @@ public class RecognizeActivity extends Activity implements RecognitionListener {
     private void finishWith(String text) {
         if (done) return;
         done = true;
+        MicA11yService.setQueryListener(null);
         Intent out = new Intent();
         ArrayList<String> list = new ArrayList<>();
         list.add(text);
@@ -111,7 +165,7 @@ public class RecognizeActivity extends Activity implements RecognitionListener {
     public void onResults(Bundle results) {
         ArrayList<String> list =
                 results == null ? null : results.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION);
-        L.f(this, "RecognizeActivity results: " + list);
+        L.f(this, "RecognizeActivity native results: " + list);
         if (list != null && !list.isEmpty() && list.get(0) != null
                 && !list.get(0).trim().isEmpty()) {
             finishWith(list.get(0).trim());
@@ -122,8 +176,8 @@ public class RecognizeActivity extends Activity implements RecognitionListener {
 
     @Override
     public void onError(int error) {
-        L.f(this, "RecognizeActivity error " + error);
-        finishCancelled();
+        L.f(this, "RecognizeActivity native error " + error);
+        // Do not cancel immediately if A11yService might still be capturing
     }
 
     @Override
@@ -140,6 +194,7 @@ public class RecognizeActivity extends Activity implements RecognitionListener {
 
     @Override
     protected void onDestroy() {
+        MicA11yService.setQueryListener(null);
         try { if (sr != null) { sr.cancel(); sr.destroy(); } } catch (Throwable ignored) {}
         sr = null;
         super.onDestroy();
