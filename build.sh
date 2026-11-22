@@ -2,7 +2,7 @@
 # Builds micbridge.apk with the Android SDK build-tools directly (no Gradle).
 set -euo pipefail
 
-SDK=${SDK:-${ANDROID_HOME:-${ANDROID_SDK_ROOT:-/tmp/opencode/sdk}}}
+SDK=${SDK:-${ANDROID_HOME:-${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}}}
 
 if [ -d "$SDK/build-tools/30.0.3" ]; then
     BT="$SDK/build-tools/30.0.3"
@@ -47,13 +47,15 @@ mkdir -p "$BUILD/gen" "$BUILD/classes" "$BUILD/dex"
     --target-sdk-version 30 \
     "$BUILD/res.zip"
 
+JAVA_FILES=$(find "$SRC/java" "$BUILD/gen" -name '*.java')
 javac -source 8 -target 8 -encoding UTF-8 -nowarn \
     -classpath "$PLATFORM" \
     -d "$BUILD/classes" \
-    $(find "$SRC/java" "$BUILD/gen" -name '*.java')
+    $JAVA_FILES
 
+CLASS_FILES=$(find "$BUILD/classes" -name '*.class')
 "$BT/d8" --lib "$PLATFORM" --min-api 21 --output "$BUILD/dex" \
-    $(find "$BUILD/classes" -name '*.class')
+    $CLASS_FILES
 
 python3 - "$BUILD" <<'PY'
 import sys, zipfile

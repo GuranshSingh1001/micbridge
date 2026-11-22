@@ -12,6 +12,8 @@ jobs:
   build:
     name: Build & Release APK
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
 
     steps:
       - name: Checkout repository
@@ -23,13 +25,16 @@ jobs:
           distribution: 'temurin'
           java-version: '17'
 
-      - name: Set up Android SDK
-        uses: android-actions/setup-android@v3
-
       - name: Install Android Platform 30 & Build-Tools
         run: |
-          yes | sdkmanager --licenses || true
-          sdkmanager "platforms;android-30" "build-tools;30.0.3"
+          SDKMANAGER="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          if [ ! -x "$SDKMANAGER" ]; then
+            SDKMANAGER="$(which sdkmanager || true)"
+          fi
+          if [ -n "$SDKMANAGER" ]; then
+            yes | "$SDKMANAGER" --licenses || true
+            "$SDKMANAGER" "platforms;android-30" "build-tools;30.0.3"
+          fi
 
       - name: Build APK via build.sh
         run: |
