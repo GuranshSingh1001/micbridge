@@ -144,6 +144,13 @@ public class MicA11yService extends AccessibilityService {
         L.f(this, "blocklist: Jio/preset + launcher + Settings/SystemUI; allow="
                 + allowSetting());
 
+        try {
+            android.provider.Settings.Global.putString(getContentResolver(), "jio_stb_active_language", "en-IN");
+            android.provider.Settings.Global.putString(getContentResolver(), "system_SelectedLanguage", "en-IN");
+            android.provider.Settings.System.putString(getContentResolver(), "system_SelectedLanguage", "en-IN");
+            android.provider.Settings.System.putString(getContentResolver(), "system_locales", "en-IN");
+        } catch (Throwable ignored) {}
+
         // Debug hook: adb shell am broadcast -a dev.dedsec.micbridge.TEST
         //   --es query "some text"   (deliver directly)
         //   --es target <pkg>        (override the foreground app)
@@ -506,6 +513,12 @@ public class MicA11yService extends AccessibilityService {
             return false;
         }
 
+        // Instructional mic prompts in both English and Hindi (e.g. "बोलने के लिए माईक दबाएं")
+        if ((l.contains("बोलने") || l.contains("दबा") || l.contains("प्रेस") || l.contains("press") || l.contains("hold") || l.contains("tap"))
+                && (l.contains("माईक") || l.contains("माइक") || l.contains("mic") || l.contains("speak") || l.contains("लिए") || l.contains("button"))) {
+            return false;
+        }
+
         // English prompts
         if (l.contains("listening")
                 || l.contains("speak now")
@@ -515,14 +528,18 @@ public class MicA11yService extends AccessibilityService {
                 || l.contains("tap to speak")
                 || l.contains("im listening")
                 || l.contains("i'm listening")
+                || l.contains("press mic")
+                || l.contains("press to speak")
+                || l.contains("what can i do")
                 || l.equals("on")
                 || l.equals("off")
                 || l.equals("try again")
-                || l.equals("mic")) {
+                || l.equals("mic")
+                || l.equals("microphone")) {
             return false;
         }
 
-        // Hindi listening prompts (Crucial for Jio STB firmware!)
+        // Hindi listening & helper prompts
         if (l.contains("सुन रहे")
                 || l.contains("सुन रहा")
                 || l.contains("सुन रही")
@@ -534,11 +551,26 @@ public class MicA11yService extends AccessibilityService {
                 || l.contains("कुछ बोलिये")
                 || l.contains("कहिए")
                 || l.contains("कहिये")
-                || l.contains("बोलना शुरू करें")) {
+                || l.contains("बोलना शुरू")
+                || l.contains("शुरू करें")
+                || l.contains("माईक दबा")
+                || l.contains("माइक दबा")
+                || l.contains("बोलने के लिए")
+                || l.equals("माइक")
+                || l.equals("माईक")
+                || l.equals("दबाएं")
+                || l.equals("दबाएँ")
+                || l.equals("दबाइए")
+                || l.equals("दबायें")
+                || l.equals("दबाओ")
+                || l.equals("हेलो")
+                || l.equals("हेलो हेलो")
+                || l.equals("हेलो जियो")
+                || l.equals("हेलो जीयो")) {
             return false;
         }
 
-        // Error / failure messages in English
+        // Error / failure messages in English & Hindi
         String[] bad = {
                 "sorry", "didn't", "did not", "not able", "no result",
                 "something went wrong", "could not", "couldn't", "try saying",

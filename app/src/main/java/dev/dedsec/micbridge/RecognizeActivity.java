@@ -69,6 +69,20 @@ public class RecognizeActivity extends Activity implements RecognitionListener, 
         }, 15000);
     }
 
+    private void applyEnglishExtras(Intent i) {
+        if (i == null) return;
+        i.putExtra(RecognizerIntent.EXTRA_LANGUAGE, "en-IN");
+        i.putExtra(RecognizerIntent.EXTRA_LANGUAGE_PREFERENCE, "en-IN");
+        i.putExtra("android.speech.extra.LANGUAGE", "en-IN");
+        i.putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM);
+        i.putExtra("language", "en-IN");
+        i.putExtra("lang", "en");
+        i.putExtra("locale", "en-IN");
+        i.putExtra("SELECTED_LANGUAGE", "en-IN");
+        i.putExtra("selectedLanguage", "en-IN");
+        i.putExtra("system_SelectedLanguage", "en-IN");
+    }
+
     private boolean tryLaunchJioVoice() {
         try {
             // First attempt: direct component launch for Jio Voice Assistant
@@ -76,16 +90,18 @@ public class RecognizeActivity extends Activity implements RecognitionListener, 
             i.setComponent(new ComponentName(MicA11yService.JIO_VA,
                     "com.android.app.jio.voiceassist.search.modified.ui.MainActivity"));
             i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+            applyEnglishExtras(i);
             startActivity(i);
-            L.f(this, "RecognizeActivity: launched Jio VA via component");
+            L.f(this, "RecognizeActivity: launched Jio VA via component (English)");
             return true;
         } catch (Throwable t1) {
             try {
                 Intent launch = getPackageManager().getLaunchIntentForPackage(MicA11yService.JIO_VA);
                 if (launch != null) {
                     launch.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+                    applyEnglishExtras(launch);
                     startActivity(launch);
-                    L.f(this, "RecognizeActivity: launched Jio VA via launch intent");
+                    L.f(this, "RecognizeActivity: launched Jio VA via launch intent (English)");
                     return true;
                 }
             } catch (Throwable t2) {
@@ -93,8 +109,9 @@ public class RecognizeActivity extends Activity implements RecognitionListener, 
                     Intent assist = new Intent(Intent.ACTION_ASSIST);
                     assist.setPackage(MicA11yService.JIO_VA);
                     assist.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+                    applyEnglishExtras(assist);
                     startActivity(assist);
-                    L.f(this, "RecognizeActivity: launched Jio VA via assist intent");
+                    L.f(this, "RecognizeActivity: launched Jio VA via assist intent (English)");
                     return true;
                 } catch (Throwable ignored) {}
             }
@@ -117,14 +134,14 @@ public class RecognizeActivity extends Activity implements RecognitionListener, 
                     in != null && in.hasExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL)
                             ? in.getStringExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL)
                             : RecognizerIntent.LANGUAGE_MODEL_FREE_FORM);
-            i.putExtra(RecognizerIntent.EXTRA_LANGUAGE,
-                    in != null && in.hasExtra(RecognizerIntent.EXTRA_LANGUAGE)
-                            ? in.getStringExtra(RecognizerIntent.EXTRA_LANGUAGE)
-                            : "en-IN");
+            i.putExtra(RecognizerIntent.EXTRA_LANGUAGE, "en-IN");
+            i.putExtra(RecognizerIntent.EXTRA_LANGUAGE_PREFERENCE, "en-IN");
+            i.putExtra("android.speech.extra.LANGUAGE", "en-IN");
             i.putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, false);
             i.putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 5);
+            applyEnglishExtras(i);
             sr.startListening(i);
-            L.f(this, "RecognizeActivity: started native listening");
+            L.f(this, "RecognizeActivity: started native listening (English)");
         } catch (Throwable t) {
             L.f(this, "RecognizeActivity native fallback failed: " + t);
         }
