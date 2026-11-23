@@ -118,6 +118,8 @@ public class MicA11yService extends AccessibilityService {
     private long lastBlockedLog;
     private String lastQuery;
     private int stableCount;
+    private boolean overlaySeen;
+    private int overlayAbsentCount;
 
     /** set once we clicked a search entry point for the current capture */
     private boolean searchClicked;
@@ -191,6 +193,17 @@ public class MicA11yService extends AccessibilityService {
 
         // We act on window state/hierarchy changes, or any event from Jio VA
         boolean isJioEvent = (eventPkg != null && JIO_VA.equals(eventPkg));
+
+        // If currently capturing, listen directly to Jio VA events for text updates
+        if (busy) {
+            if (isJioEvent) {
+                overlaySeen = true;
+                overlayAbsentCount = 0;
+                checkJioEventForQuery(event);
+            }
+            return;
+        }
+
         if (type != AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED
                 && type != AccessibilityEvent.TYPE_WINDOWS_CHANGED
                 && !isJioEvent) {
@@ -198,7 +211,7 @@ public class MicA11yService extends AccessibilityService {
         }
 
         long now = System.currentTimeMillis();
-        if (busy || (now - lastTrigger <= 2500) || !jioOverlayPresent()) return;
+        if ((now - lastTrigger <= 1000) || !jioOverlayPresent()) return;
 
         // Target resolution
         String target = resolveTarget(now);
@@ -215,6 +228,40 @@ public class MicA11yService extends AccessibilityService {
         }
         L.f(this, "voice overlay over " + target + " -> capturing");
         startCapture(target);
+    }
+
+    private void checkJioEventForQuery(AccessibilityEvent event) {
+        try {
+            List<CharSequence> texts = event.getText();
+            if (texts != null) {
+                for (CharSequence cs : texts) {
+                    if (cs != null) {
+                        String s = cs.toString().trim();
+                        if (plausibleQuery(s)) {
+                            updateQueryFromEvent(s);
+                            return;
+                        }
+                    }
+                }
+            }
+            AccessibilityNodeInfo src = event.getSource();
+            if (src != null) {
+                String s = extractNodeText(src);
+                if (s != null && plausibleQuery(s)) {
+                    updateQueryFromEvent(s);
+                }
+            }
+        } catch (Throwable ignored) {}
+    }
+
+    private void updateQueryFromEvent(String q) {
+        if (q == null) return;
+        if (q.equals(lastQuery)) {
+            stableCount++;
+        } else {
+            lastQuery = q;
+            stableCount = 0;
+        }
     }
 
     private String resolveTarget(long now) {
@@ -265,7 +312,7 @@ public class MicA11yService extends AccessibilityService {
             if (busy) return;
             if (jioOverlayPresent()) {
                 long now = System.currentTimeMillis();
-                if (now - lastTrigger > 2500) {
+                if (now - lastTrigger > 1000) {
                     if (isBlocked(target)) {
                         L.f(MicA11yService.this, "voice overlay over " + target + " (watched) -> blocked");
                     } else {
@@ -349,12 +396,16 @@ public class MicA11yService extends AccessibilityService {
         lastTrigger = System.currentTimeMillis();
         lastQuery = null;
         stableCount = 0;
+        overlaySeen = false;
+        overlayAbsentCount = 0;
         searchClicked = false;
         poll(target, 0);
     }
 
     private void poll(final String target, final int tick) {
-        if (tick > 90) { // ~27 s
+        if (!busy) return;
+
+        if (tick > 120) { // ~18 s (at 150ms intervals)
             L.f(this, "capture timeout");
             busy = false;
             notifyListenerFailed();
@@ -362,20 +413,10 @@ public class MicA11yService extends AccessibilityService {
         }
 
         boolean overlayPresent = jioOverlayPresent();
-        if (!overlayPresent) {
-            // If the overlay closed and we already had a captured query, deliver it!
-            if (lastQuery != null && !lastQuery.isEmpty()) {
-                L.f(this, "overlay closed with query: \"" + lastQuery + "\" -> delivering");
-                deliver(target, lastQuery);
-                return;
-            }
-            if (tick > 3) {
-                L.f(this, "overlay closed before a query appeared");
-                busy = false;
-                notifyListenerFailed();
-                return;
-            }
-        } else {
+        if (overlayPresent) {
+            overlaySeen = true;
+            overlayAbsentCount = 0;
+
             String q = readQuery();
             if (q != null) {
                 if (q.equals(lastQuery)) {
@@ -392,8 +433,34 @@ public class MicA11yService extends AccessibilityService {
                     return;
                 }
             }
+        } else {
+            if (overlaySeen) {
+                overlayAbsentCount++;
+                // If overlay was seen and has now vanished for >= 2 ticks (~300ms)
+                if (overlayAbsentCount >= 2) {
+                    if (lastQuery != null && !lastQuery.isEmpty()) {
+                        L.f(this, "overlay closed with query: \"" + lastQuery + "\" -> delivering");
+                        deliver(target, lastQuery);
+                        return;
+                    }
+                    if (tick > 6) { // ~900ms after start
+                        L.f(this, "overlay closed before a query appeared");
+                        busy = false;
+                        notifyListenerFailed();
+                        return;
+                    }
+                }
+            } else {
+                // Overlay not seen yet; wait up to ~4 seconds for it to appear
+                if (tick > 26) {
+                    L.f(this, "overlay never appeared after mic press");
+                    busy = false;
+                    notifyListenerFailed();
+                    return;
+                }
+            }
         }
-        h.postDelayed(() -> poll(target, tick + 1), 300);
+        h.postDelayed(() -> poll(target, tick + 1), 150);
     }
 
     private boolean isFinalUi() {
@@ -636,7 +703,7 @@ public class MicA11yService extends AccessibilityService {
                 String url = "https://www.youtube.com/results?search_query=" + Uri.encode(query);
                 Intent i = new Intent(Intent.ACTION_VIEW, Uri.parse(url));
                 i.setPackage(target);
-                i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+                i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_CLEAR_TOP);
                 startActivity(i);
                 return true;
             } catch (Throwable t) {
@@ -660,7 +727,7 @@ public class MicA11yService extends AccessibilityService {
                     }
                     Intent i = new Intent(Intent.ACTION_VIEW, Uri.parse(url));
                     i.setPackage(target);
-                    i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+                    i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_CLEAR_TOP);
                     startActivity(i);
                     return true;
                 } catch (Throwable t) {

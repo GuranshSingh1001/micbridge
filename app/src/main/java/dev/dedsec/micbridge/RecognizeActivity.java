@@ -38,7 +38,7 @@ public class RecognizeActivity extends Activity implements RecognitionListener, 
         LinearLayout box = new LinearLayout(this);
         box.setOrientation(LinearLayout.VERTICAL);
         box.setGravity(Gravity.CENTER);
-        box.setBackgroundColor(Color.BLACK);
+        box.setBackgroundColor(0x99000000);
 
         label = new TextView(this);
         label.setText("Listening…");
@@ -174,6 +174,7 @@ public class RecognizeActivity extends Activity implements RecognitionListener, 
         ArrayList<String> list = new ArrayList<>();
         list.add(text);
         out.putStringArrayListExtra(RecognizerIntent.EXTRA_RESULTS, list);
+        out.putExtra(RecognizerIntent.EXTRA_CONFIDENCE_SCORES, new float[]{1.0f});
         setResult(RESULT_OK, out);
         finish();
     }
