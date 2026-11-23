@@ -8,6 +8,8 @@ import android.content.Intent;
 import android.content.IntentFilter;
 import android.content.pm.PackageManager;
 import android.content.pm.ResolveInfo;
+import android.net.Uri;
+import android.os.Build;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
@@ -26,14 +28,11 @@ import java.util.Locale;
  * The firmware always launches com.android.app.jio.voiceassist for the mic
  * key and that app is the only client the speech service accepts, so this
  * service lets it do the recognition, reads the recognised query from
- * voiceStatesView (or fallback views/text hierarchy), closes the overlay,
- * and types the text into the app that was in the foreground.
+ * voiceStatesView, closes the overlay, and delivers the text to the app that
+ * was in the foreground.
  *
- * Routing is global. Only Jio/preset apps, the current launcher, Settings and
- * SystemUI keep their stock behaviour. A package can always be forced back
- * into the generic flow with:
- *
- *   adb shell settings put global micbridge_allow "com.example.app,com.other.*"
+ * Supports Leanback apps, Cobalt / TizenTube / SmartTube, TV Bro / browsers,
+ * and generic Android TV apps.
  */
 public class MicA11yService extends AccessibilityService {
 
@@ -302,11 +301,6 @@ public class MicA11yService extends AccessibilityService {
         return false;
     }
 
-    /**
-     * True when the package keeps its stock mic behaviour: Jio/preset apps,
-     * the launcher, Settings, SystemUI, the voice app and ourselves. The
-     * micbridge_allow setting always wins.
-     */
     private boolean isBlocked(String pkg) {
         if (pkg == null || pkg.isEmpty()) return true;
         if (JIO_VA.equals(pkg) || getPackageName().equals(pkg)) return true;
@@ -498,21 +492,67 @@ public class MicA11yService extends AccessibilityService {
         }
     }
 
+    /**
+     * Filters out non-speech prompts in both English and Hindi.
+     */
     private boolean plausibleQuery(String s) {
-        if (s == null || s.length() < 2) return false;
-        String l = s.toLowerCase(Locale.US);
-        if (l.contains("listening") || l.contains("speak now") || l.contains("say something")) return false;
-        if (l.equals("on") || l.equals("off")
-                || l.equals("try again") || l.equals("…") || l.equals("...") || l.equals("mic")) {
+        if (s == null) return false;
+        String t = s.trim();
+        if (t.length() < 2) return false;
+
+        String l = t.toLowerCase(Locale.US);
+
+        if (l.equals("…") || l.equals("...") || l.equals("..") || l.equals(".") || l.equals("-")) {
             return false;
         }
-        String[] bad = {"sorry", "didn't", "did not", "not able", "no result",
+
+        // English prompts
+        if (l.contains("listening")
+                || l.contains("speak now")
+                || l.contains("say something")
+                || l.contains("try saying")
+                || l.contains("how can i help")
+                || l.contains("tap to speak")
+                || l.contains("im listening")
+                || l.contains("i'm listening")
+                || l.equals("on")
+                || l.equals("off")
+                || l.equals("try again")
+                || l.equals("mic")) {
+            return false;
+        }
+
+        // Hindi listening prompts (Crucial for Jio STB firmware!)
+        if (l.contains("सुन रहे")
+                || l.contains("सुन रहा")
+                || l.contains("सुन रही")
+                || l.contains("बोलिए")
+                || l.contains("बोलिये")
+                || l.contains("कुछ कहिए")
+                || l.contains("कुछ कहिये")
+                || l.contains("कुछ बोलिए")
+                || l.contains("कुछ बोलिये")
+                || l.contains("कहिए")
+                || l.contains("कहिये")
+                || l.contains("बोलना शुरू करें")) {
+            return false;
+        }
+
+        // Error / failure messages in English
+        String[] bad = {
+                "sorry", "didn't", "did not", "not able", "no result",
                 "something went wrong", "could not", "couldn't", "try saying",
-                "network", "please try", "tap to speak", "google assistant",
-                "voice assistant", "hello jio"};
+                "network", "please try", "couldn't hear", "didn't catch",
+                "no internet", "timed out", "error", "voice assistant",
+                "google assistant", "hello jio",
+                "माफ़", "माफ", "क्षमा", "दोबारा", "कोशिश", "समस्या",
+                "समझ नहीं", "परिणाम नहीं", "इंटरनेट", "नेटवर्क", "त्रुटि",
+                "नमस्ते", "हेलो जियो", "हेलो जीयो"
+        };
         for (String b : bad) {
             if (l.contains(b)) return false;
         }
+
         return true;
     }
 
@@ -546,6 +586,60 @@ public class MicA11yService extends AccessibilityService {
         }
     }
 
+    /**
+     * Special handling for apps that lack traditional Android EditText widgets (Cobalt / TizenTube)
+     * or web browsers (TV Bro) that support direct search intents.
+     */
+    private boolean deliverSpecial(String target, String text) {
+        if (target == null || text == null || text.trim().isEmpty()) return false;
+        String query = text.trim();
+
+        // 1. YouTube / TizenTube / Cobalt family
+        if (target.contains("tizentube") || target.contains("cobalt")
+                || target.equals("com.google.android.youtube.tv")
+                || target.equals("org.smarttube.stable")
+                || target.equals("org.smarttube.beta")
+                || target.equals("com.teamsmart.videomanager.tv")) {
+            try {
+                String url = "https://www.youtube.com/results?search_query=" + Uri.encode(query);
+                Intent i = new Intent(Intent.ACTION_VIEW, Uri.parse(url));
+                i.setPackage(target);
+                i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+                startActivity(i);
+                return true;
+            } catch (Throwable t) {
+                L.e("deliverSpecial youtube failed: " + t);
+            }
+        }
+
+        // 2. TV Bro and web browsers: if no text field is currently focused, open search URL
+        if (target.contains("tvwebbrowser") || target.contains("browser")) {
+            AccessibilityNodeInfo root = getRootInActiveWindow();
+            AccessibilityNodeInfo focused = (root != null) ? root.findFocus(AccessibilityNodeInfo.FOCUS_INPUT) : null;
+            if (focused == null || !isEditable(focused)) {
+                try {
+                    String url;
+                    if (query.startsWith("http://") || query.startsWith("https://")) {
+                        url = query;
+                    } else if (query.contains(".") && !query.contains(" ") && query.length() > 3) {
+                        url = "https://" + query;
+                    } else {
+                        url = "https://www.google.com/search?q=" + Uri.encode(query);
+                    }
+                    Intent i = new Intent(Intent.ACTION_VIEW, Uri.parse(url));
+                    i.setPackage(target);
+                    i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+                    startActivity(i);
+                    return true;
+                } catch (Throwable t) {
+                    L.e("deliverSpecial browser failed: " + t);
+                }
+            }
+        }
+
+        return false;
+    }
+
     private void deliverToApp(final String target, final String text, final int tries) {
         String top = topPackage();
         boolean overlayStillUp = jioOverlayPresent() || (top != null && JIO_VA.equals(top));
@@ -555,7 +649,7 @@ public class MicA11yService extends AccessibilityService {
             if (tries < 5) {
                 L.f(this, "dismissing Jio overlay");
                 performGlobalAction(GLOBAL_ACTION_BACK);
-                h.postDelayed(() -> deliverToApp(target, text, tries + 1), 400);
+                h.postDelayed(() -> deliverToApp(target, text, tries + 1), 350);
             } else {
                 L.f(this, "could not dismiss Jio overlay");
                 busy = false;
@@ -563,10 +657,17 @@ public class MicA11yService extends AccessibilityService {
             return;
         }
 
+        // Fast-path intent delivery for Cobalt/TizenTube and Browsers
+        if (deliverSpecial(target, text)) {
+            L.f(this, "delivered to " + target + " via special intent: " + text);
+            busy = false;
+            return;
+        }
+
         String activePkg = activeAppPackage();
         if (activePkg != null && !activePkg.equals(target)) {
             if (tries < 5) {
-                h.postDelayed(() -> deliverToApp(target, text, tries + 1), 400);
+                h.postDelayed(() -> deliverToApp(target, text, tries + 1), 350);
             } else {
                 L.f(this, "target never came to front (" + target + ", active=" + activePkg + ")");
                 busy = false;
@@ -576,7 +677,7 @@ public class MicA11yService extends AccessibilityService {
 
         AccessibilityNodeInfo root = getRootInActiveWindow();
         if (root == null) {
-            if (tries < 5) h.postDelayed(() -> deliverToApp(target, text, tries + 1), 400);
+            if (tries < 5) h.postDelayed(() -> deliverToApp(target, text, tries + 1), 350);
             else busy = false;
             return;
         }
@@ -591,7 +692,7 @@ public class MicA11yService extends AccessibilityService {
                 busy = false;
             } else if (tries < 5) {
                 L.f(this, "could not type into " + nodeName(field) + "; retrying");
-                h.postDelayed(() -> deliverToApp(target, text, tries + 1), 400);
+                h.postDelayed(() -> deliverToApp(target, text, tries + 1), 350);
             } else {
                 L.f(this, "could not type into " + nodeName(field));
                 busy = false;
@@ -605,13 +706,13 @@ public class MicA11yService extends AccessibilityService {
                 searchClicked = true;
                 L.f(this, "opening search in " + target + " via " + nodeName(s));
                 click(s);
-                h.postDelayed(() -> deliverToApp(target, text, tries + 1), 800);
+                h.postDelayed(() -> deliverToApp(target, text, tries + 1), 700);
                 return;
             }
         }
 
         if (tries < 5) {
-            h.postDelayed(() -> deliverToApp(target, text, tries + 1), 500);
+            h.postDelayed(() -> deliverToApp(target, text, tries + 1), 400);
         } else {
             AccessibilityNodeInfo focus = null;
             try { focus = root.findFocus(AccessibilityNodeInfo.FOCUS_INPUT); }
@@ -764,12 +865,26 @@ public class MicA11yService extends AccessibilityService {
         if (t != null) t.performAction(AccessibilityNodeInfo.ACTION_CLICK);
     }
 
-    /** Focus/click the field first, then set the text. */
+    /** Focus/click the field first, then set the text and trigger submit. */
     private boolean typeInto(AccessibilityNodeInfo node, String text) {
-        if (setText(node, text)) return true;
+        if (setText(node, text)) {
+            triggerImeAction(node);
+            return true;
+        }
         try { node.performAction(AccessibilityNodeInfo.ACTION_CLICK); } catch (Throwable ignored) {}
         node.performAction(AccessibilityNodeInfo.ACTION_FOCUS);
-        return setText(node, text);
+        boolean ok = setText(node, text);
+        if (ok) triggerImeAction(node);
+        return ok;
+    }
+
+    private void triggerImeAction(AccessibilityNodeInfo node) {
+        if (node == null) return;
+        try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                node.performAction(AccessibilityNodeInfo.AccessibilityAction.ACTION_IME_ENTER.getId());
+            }
+        } catch (Throwable ignored) {}
     }
 
     private boolean setText(AccessibilityNodeInfo node, String text) {
