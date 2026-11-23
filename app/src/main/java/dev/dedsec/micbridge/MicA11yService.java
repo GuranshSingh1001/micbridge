@@ -728,6 +728,9 @@ public class MicA11yService extends AccessibilityService {
                     Intent i = new Intent(Intent.ACTION_VIEW, Uri.parse(url));
                     i.setPackage(target);
                     i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_CLEAR_TOP);
+                    i.putExtra("com.phlox.tvwebbrowser.EXTRA_OPEN_IN_SAME_TAB", true);
+                    i.putExtra("create_new_tab", false);
+                    i.putExtra("com.android.browser.application_id", target);
                     startActivity(i);
                     return true;
                 } catch (Throwable t) {
